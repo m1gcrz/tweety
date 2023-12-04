@@ -1,15 +1,15 @@
 # Use the official Alpine Linux base image
-FROM alpine:latest
+FROM python:latest
 
-# Set environment variables (optional)
-ENV MY_VARIABLE=value
+RUN pip install httpx
+RUN pip install python-dateutil
+RUN pip install openpyxl
+RUN pip install tweety-ns
 
-# Install necessary packages or dependencies
-RUN apk update && \
-    apk add --no-cache \
-    package1 \
-    package2 \
-    && rm -rf /var/cache/apk/*
+
+ENV xu=feed@migcrz.com
+ENV xp=P@ssw0rd1234
+ENV xe=ijx3djq8
 
 # Set the working directory inside the container (optional)
 WORKDIR /app
@@ -18,7 +18,7 @@ WORKDIR /app
 COPY . /app
 
 # Expose any necessary ports (optional)
-EXPOSE 80
+# EXPOSE 80
 
 # Define any default command to run when the container starts
-CMD ["sh", "-c", "echo Hello, this is your Docker container!"]
+CMD ["tail", "-f", "/dev/null"]
