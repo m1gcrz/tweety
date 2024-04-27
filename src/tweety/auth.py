@@ -22,6 +22,7 @@ class AuthMethods:
         self.request.set_user(self.user)
         self.session.set_session_user(self.user)
         self._is_connected = True
+        self.is_user_authorized = True
         return self.user
 
     def start(
@@ -48,15 +49,26 @@ class AuthMethods:
             try:
                 return self.connect()
             except InvalidCredentials:
+                self.request.set_cookies("", False)
                 pass
 
         username = input('Please enter the Username: ') if not username else username
         password = getpass.getpass('Please enter your password: ') if not password else password
-        try:
-            return self.sign_in(username, password, extra=extra)
-        except ActionRequired as e:
-            action = input(f"\rAction Required :> {str(e.message)} : ")
-            return self.sign_in(username, password, extra=action)
+
+        _extra_once = False
+        while not self.logged_in:
+            try:
+                return self.sign_in(username, password, extra=extra)
+            except ActionRequired as e:
+                action = input(f"\rAction Required :> {str(e.message)} : ")
+                _extra_once = True
+                return self.sign_in(username, password, extra=action)
+            except InvalidCredentials as ask_info:
+                if _extra_once:
+                    action = input(f"\rAction Required :> {str(ask_info.message)} : ")
+                    return self.sign_in(username, password, extra=action)
+                else:
+                    raise ask_info
 
     def sign_in(
             self,
@@ -81,6 +93,7 @@ class AuthMethods:
             try:
                 return self.connect()
             except InvalidCredentials:
+                self.request.set_cookies("", False)
                 pass
 
         self._username = username
@@ -144,7 +157,11 @@ class AuthMethods:
         while not self.logged_in:
             _login_payload = self._login_flow.get(self._login_flow_state, json_=self._last_json, username=_username, password=_password, extra=_extra)
             response = self.request.login(self._login_url, _payload=_login_payload)
+
             self._last_json = response.json()
+
+            if response.cookies.get("att"):
+                self.request.add_header("Att", response.cookies.get("att"))
 
             if self._last_json.get('status') != "success":
                 raise DeniedLogin(response=response, message=response.text)
@@ -162,8 +179,9 @@ class AuthMethods:
                 raise DeniedLogin(response=response, message=reason)
 
             if subtask == "LoginSuccessSubtask":
+                self.request.remove_header("Att")
                 self.logged_in = True
-                self.cookies = Cookies(response.headers['set-cookie'], True)
+                self.cookies = Cookies(dict(response.cookies))
                 self.session.save_session(self.cookies)
                 return self.connect()
 

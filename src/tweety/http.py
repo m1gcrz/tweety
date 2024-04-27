@@ -1,22 +1,28 @@
 import inspect
 import os
 import re
+import warnings
 from typing import Callable
-import httpx as s
+from urllib.parse import quote
+import httpx
 from .exceptions_ import GuestTokenNotFound, UnknownError, UserNotFound, InvalidCredentials
 from .types.n_types import GenericError
 from .utils import custom_json, GUEST_TOKEN_REGEX
 from .builder import UrlBuilder
 
-s.Response.json_ = custom_json
+httpx.Response.json = custom_json
 
 
 class Request:
-    def __init__(self, max_retries=10, proxy=None):
+    def __init__(self, client, max_retries=10, proxy=None, **kwargs):
+
+        timeout = kwargs.pop("timeout", 60)
+
         self.user = None
         self.username = None
+        self._client = client
         self._limits = {}
-        self.__session = s.Client(proxies=proxy, timeout=60)
+        self.__session = httpx.Client(proxies=proxy, timeout=timeout, **kwargs)
         self.__builder = UrlBuilder()
         self.__guest_token = self._get_guest_token(max_retries)
         self.__builder.guest_token = self.__guest_token
@@ -25,10 +31,23 @@ class Request:
     def session(self):
         return self.__session
 
-    def set_cookies(self, cookies):
+    def add_header(self, key, value):
+        self.__session.headers[key] = value
+        self.__builder.custom_headers.update({key: value})
+
+    def remove_header(self, key):
+        if self.__session.headers.get(key):
+            del self.__session.headers[key]
+
+        if self.__builder.custom_headers.get(key):
+            del self.__builder.custom_headers[key]
+
+    def set_cookies(self, cookies, verify=True):
         self.__session.headers['Cookie'] = cookies
         self.__builder.set_cookies(cookies)
-        self._verify_cookies()
+
+        if verify:
+            self._verify_cookies()
 
     def set_user(self, user):
         self.user = user
@@ -56,11 +75,11 @@ class Request:
         if is_document:
             return response
 
-        response_json = response.json_()  # noqa
+        response_json = response.json()  # noqa
         if ignore_none_data and len(response.text) == 0:
             return None
 
-        if response.text and response.text.lower() == "rate limit exceeded":
+        if (not response_json and response.text and response.text.lower() == "rate limit exceeded") or response.status_code == 429:
             response_json = {"errors": [{"code": 88, "message": "Rate limit exceeded."}]}
 
         if not response_json:
@@ -68,7 +87,7 @@ class Request:
                 error_code=response.status_code,
                 error_name="Server Error",
                 response=response,
-                message="Unknown Error Occurs on Twitter" if not response.text else response.text
+                message="Unknown Error Occurs on Twitter"
             )
 
         if response_json.get("errors") and not response_json.get('data'):
@@ -87,11 +106,21 @@ class Request:
         for retry in range(max_retries):
             last_response = self.__get_response__(**self.__builder.get_guest_token())
             token = self.__builder.guest_token = last_response.get('guest_token')  # noqa
+
             if token:
                 return token
 
-        raise GuestTokenNotFound(None, None, last_response,
-                                 f"Guest Token couldn't be found after {max_retries} retires.")
+            request_data = self.__builder.get_guest_token_fallback()
+            del request_data['headers']['Authorization']
+            del request_data['headers']['Content-Type']
+            del request_data['headers']['X-Csrf-Token']
+            response = self.__get_response__(is_document=True, **request_data)
+            guest_token = re.findall(GUEST_TOKEN_REGEX, response.text)
+
+            if guest_token:
+                return guest_token[0]
+
+        raise GuestTokenNotFound(error_code=last_response, message=f"Guest Token couldn't be found after {max_retries} retires.")
 
     def _init_api(self):
         data = self.__builder.init_api()
@@ -119,6 +148,11 @@ class Request:
 
         raise UserNotFound(error_code=50, error_name="GenericUserNotFound", response=response)
 
+    def get_users_by_rest_id(self, user_ids):
+        request_data = self.__builder.users_by_rest_id([str(i) for i in user_ids])
+        response = self.__get_response__(**request_data)
+        return response
+
     def login(self, _url, _payload):
         request_data = self.__builder.build_flow(_url)
         request_data['json'] = _payload
@@ -131,6 +165,21 @@ class Request:
         response = self.__get_response__(**request_data)
         return response
 
+    def get_medias(self, user_id, cursor=None):
+        request_data = self.__builder.user_media(user_id=user_id, cursor=cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def get_highlights(self, user_id, cursor=None):
+        request_data = self.__builder.user_highlights(user_id=user_id, cursor=cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def get_likes(self, user_id, cursor=None):
+        request_data = self.__builder.user_likes(user_id=user_id, cursor=cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
     def get_trends(self):
         response = self.__get_response__(**self.__builder.trends())
         return response
@@ -139,11 +188,19 @@ class Request:
         if keyword.startswith("#"):
             keyword = f"%23{keyword[1:]}"
 
+        keyword = quote(keyword, safe='"()%')
         request_data = self.__builder.search(keyword, cursor, filter_)
-        # del request_data['headers']['content-type']
-        # request_data['headers']['referer'] = f"https://twitter.com/search?q={keyword}"
-
         response = self.__get_response__(**request_data)
+        return response
+
+    def search_typehead(self, q, result_type='events,users,topics,lists'):
+        request = self.__builder.search_typehead(q, result_type)
+        response = self.__get_response__(**request)
+        return response
+
+    def search_place(self, lat, long, search_term):
+        request = self.__builder.search_place(lat, long, search_term)
+        response = self.__get_response__(**request)
         return response
 
     def get_tweet_detail(self, tweetId, cursor=None):
@@ -151,6 +208,25 @@ class Request:
             response = self.__get_response__(**self.__builder.tweet_detail(tweetId, cursor))
         else:
             response = self.__get_response__(**self.__builder.tweet_detail_as_guest(tweetId))
+        return response
+
+    def get_tweet_analytics(self, tweet_id):
+        request = self.__builder.get_tweet_analytics(tweet_id)
+        response = self.__get_response__(**request)
+        return response
+
+    def get_blocked_users(self, cursor):
+        request = self.__builder.get_blocked_users(cursor)
+        response = self.__get_response__(**request)
+        return response
+
+    def get_tweet_translation(self, tweet_id, target_language):
+        request = self.__builder.tweet_translate(tweet_id, target_language)
+        response = self.__get_response__(**request)
+        return response
+
+    def get_tweet_edit_history(self, tweet_id):
+        response = self.__get_response__(**self.__builder.tweet_edit_history(tweet_id))
         return response
 
     def get_mentions(self, user_id, cursor=None):
@@ -161,8 +237,22 @@ class Request:
         response = self.__get_response__(**self.__builder.get_bookmarks(cursor))
         return response
 
-    def get_inbox(self, user_id, cursor=None):
-        response = self.__get_response__(**self.__builder.get_inbox(cursor))
+    def bookmark_tweet(self, tweet_id):
+        response = self.__get_response__(**self.__builder.bookmark_tweet(tweet_id))
+        return response
+
+    def delete_bookmark_tweet(self, tweet_id):
+        response = self.__get_response__(**self.__builder.delete_tweet_bookmark(tweet_id))
+        return response
+
+    def get_initial_inbox(self):
+        request = self.__builder.get_initial_inbox()
+        response = self.__get_response__(**request)
+        return response
+
+    def get_inbox_updates(self, cursor, active_conversation=None):
+        request = self.__builder.get_inbox_updates(cursor, active_conversation)
+        response = self.__get_response__(**request)
         return response
 
     def get_trusted_inbox(self, max_id):
@@ -197,11 +287,12 @@ class Request:
         response = self.__get_response__(**request_data)
         return response
 
-    def create_tweet(self, text, files, filter_, reply_to, pool):
+    def create_tweet(self, text, files, filter_, reply_to, quote_tweet_url, pool, geo):
         if pool:
             response = self.create_pool(pool)
             pool = response.get('card_uri')
-        request_data = self.__builder.create_tweet(text, files, filter_, reply_to, pool)
+
+        request_data = self.__builder.create_tweet(text, files, filter_, reply_to, quote_tweet_url, pool, geo)
         response = self.__get_response__(**request_data)
         return response
 
@@ -210,8 +301,8 @@ class Request:
         response = self.__get_response__(ignore_none_data=True, **request_data)
         return response
 
-    def upload_media_init(self, size, mime_type, media_category):
-        request_data = self.__builder.upload_media_init(size, mime_type, media_category)
+    def upload_media_init(self, size, mime_type, media_category, source_url):
+        request_data = self.__builder.upload_media_init(size, mime_type, media_category, source_url)
         response = self.__get_response__(**request_data)
         return response
 
@@ -233,8 +324,8 @@ class Request:
         response = self.__get_response__(**request_data)
         return response
 
-    def get_home_timeline(self, cursor=None):
-        request_data = self.__builder.home_timeline(cursor)
+    def get_home_timeline(self, timeline_type, cursor=None):
+        request_data = self.__builder.home_timeline(timeline_type, cursor)
         response = self.__get_response__(**request_data)
         return response
 
@@ -260,6 +351,11 @@ class Request:
 
     def like_tweet(self, tweet_id):
         request_data = self.__builder.like_tweet(tweet_id)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def unlike_tweet(self, tweet_id):
+        request_data = self.__builder.unlike_tweet(tweet_id)
         response = self.__get_response__(**request_data)
         return response
 
@@ -301,6 +397,18 @@ class Request:
 
     def unfollow_user(self, user_id):
         request_data = self.__builder.unfollow_user(user_id)
+        request_data['headers']['Content-Type'] = f"application/x-www-form-urlencoded"
+        response = self.__get_response__(**request_data)
+        return response
+    
+    def block_user(self, user_id):
+        request_data = self.__builder.block_user(user_id)
+        request_data['headers']['Content-Type'] = f"application/x-www-form-urlencoded"
+        response = self.__get_response__(**request_data)
+        return response
+
+    def unblock_user(self, user_id):
+        request_data = self.__builder.unblock_user(user_id)
         request_data['headers']['Content-Type'] = f"application/x-www-form-urlencoded"
         response = self.__get_response__(**request_data)
         return response
@@ -360,6 +468,31 @@ class Request:
         response = self.__get_response__(**request_data)
         return response
 
+    def gif_search(self, search_term, cursor):
+        request_data = self.__builder.search_gifs(search_term, cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def get_mutual_friends(self, user_id, cursor):
+        request_data = self.__builder.get_mutual_friend(user_id, cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def get_topic_landing_page(self, topic_id, cursor=None):
+        request_data = self.__builder.get_topic_landing_page(topic_id, cursor)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def add_group_member(self, member_ids, conversation_id):
+        request_data = self.__builder.add_member_to_group(member_ids, conversation_id)
+        response = self.__get_response__(**request_data)
+        return response
+
+    def pin_tweet(self, tweet_id):
+        request_data = self.__builder.pin_tweet(tweet_id)
+        response = self.__get_response__(**request_data)
+        return response
+
     def download_media(self, media_url, filename: str = None,
                        progress_callback: Callable[[str, int, int], None] = None):
         filename = os.path.basename(media_url).split("?")[0] if not filename else filename
@@ -372,7 +505,12 @@ class Request:
 
         with self.__session.stream('GET', media_url, follow_redirects=True, headers=headers, timeout=600) as response:
             response.raise_for_status()
-            total_size = int(response.headers['Content-Length'])
+            try:
+                total_size = int(response.headers['Content-Length'])
+            except:
+                warnings.warn("Unable to get 'Content-Length', it will be set to zero")
+                total_size = 0
+
             downloaded = 0
             f = open(filename, 'wb')
             for chunk in response.iter_bytes(chunk_size=8192):

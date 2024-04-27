@@ -1,17 +1,18 @@
-import re
+import warnings
 from typing import Union
-from .utils import find_objects
-from .types import Proxy, TweetComments, UserTweets, Search, User, Tweet, Trends, Community, CommunityTweets, CommunityMembers, UserFollowers, UserFollowings
+from .utils import find_objects, AuthRequired, get_user_from_typehead, get_tweet_id, check_translation_lang
+from .types import (Proxy, TweetComments, UserTweets, Search, User, Tweet, Trends, Community, CommunityTweets,
+                    CommunityMembers, UserFollowers, UserFollowings, TweetHistory, UserMedia, GifSearch,
+                    ShortUser, TypeHeadSearch, TweetTranslate, AudioSpace, UserHighlights, UserLikes, Places)
 from .exceptions_ import *
-from .session import Session
+from .session import Session, MemorySession, FileSession
 from .http import Request
-from .types.twDataTypes import AudioSpace
 
 
 class BotMethods:
     LOGIN_URL = "https://api.twitter.com/1.1/onboarding/task.json?flow_name=login"
 
-    def __init__(self, session_name: Union[str, Session], proxy: Union[dict, Proxy] = None):
+    def __init__(self, session_name: Union[str, Session], proxy: Union[dict, Proxy] = None, **httpx_kwargs):
         """
         Constructor of the Twitter Public class
 
@@ -26,46 +27,100 @@ class BotMethods:
         self._login_flow = None
         self._login_flow_state = None
         self._last_json = {}
-
-        self._event_builders = []
-        self.session = Session(session_name) if isinstance(session_name, str) else session_name
-        self.logged_in = False
+        self._cached_users = {}
         self._proxy = proxy.get_dict() if isinstance(proxy, Proxy) else proxy
-        self.request = self.http = Request(max_retries=10, proxy=self._proxy)
+        self._event_builders = []
+
+        if isinstance(session_name, MemorySession):
+            self.session = session_name(self)
+        elif isinstance(session_name, FileSession):
+            self.session = session_name
+        else:
+            self.session = FileSession(self, session_name)
+
+        self.logged_in = False
+        self.is_user_authorized = False
+        self.request = self.http = Request(self, max_retries=10, proxy=self._proxy, **httpx_kwargs)
         self.user = None
 
-    def get_user_info(self, username: str = None) -> User:
+    def get_user_info(self, username: Union[str, int, list] = None):
         """
         Get the User Info of the specified username
 
-        :param: username: (`str`) username to get information of
+        :param: username: (`str` | `int` | List[`str`, `int`]) username or user_id to get information of
 
         :return: .types.twDataTypes.User
         """
 
-        user_raw = self.request.get_user(username)
+        if not username and self.user is not None:
+            username = self.user.username
 
-        return User(user_raw, self)
+        if isinstance(username, list):
+            for i in username:
+                if not str(i).isdigit():
+                    raise ValueError("Only Accept List of User IDs.")
+
+        if isinstance(username, list) or str(username).isdigit() or isinstance(username, int):
+            usernames = [username] if not isinstance(username, list) else username
+            users_raw = self.request.get_users_by_rest_id(usernames)
+            users = find_objects(users_raw, "users", None, recursive=False, none_value=[])
+
+            parsed_users = []
+            for user in users:
+                try:
+                    this_user = User(self, user)
+                    parsed_users.append(this_user)
+                    self._cached_users[str(this_user.username).lower()] = this_user.id
+                except Exception as e:
+                    warnings.warn(f"UsersByRestId Error: {str(e)}")
+
+            if len(usernames) == 1 and len(parsed_users) > 0:
+                return parsed_users[0]
+            elif len(usernames) == 1 and len(parsed_users) == 0:
+                return None
+            elif len(usernames) > 1 and len(parsed_users) == 0:
+                return []
+            else:
+                return parsed_users
+        else:
+            user_raw = self.request.get_user(username)
+            user = User(self, user_raw)
+            self._cached_users[str(username).lower()] = user.id
+            return user
 
     @property
     def user_id(self) -> int:
         """
-        Get the user unique twitter id
+        Get the user unique twitter id of authenticated user
 
         :return: int
         """
         return self.user.id if self.user else None
 
-    def _get_user_id(self, username) -> int:
-        if isinstance(username, User):
-            user_id = username.id
-        elif isinstance(username, int):
-            user_id = username
-        elif isinstance(username, str) and str(username).isdigit():
-            user_id = int(username)
-        else:
-            user_id = self.get_user_info(username).id
+    @property
+    def cache(self):
+        return self._cached_users
 
+    def get_user_id(self, username: str):
+        return self._get_user_id(username)
+
+    def _get_user_id(self, username):
+        if isinstance(username, (User, ShortUser)):
+            user_id = username.id
+        elif isinstance(username, int) or (isinstance(username, str) and str(username).isdigit()):
+            user_id = username
+        elif self._cached_users.get(username.lower()):
+            user_id = self._cached_users[username.lower()]
+        else:
+            user = get_user_from_typehead(username, self.typehead_user_search(username))
+
+            if not user:
+                user = self.get_user_info(username)
+
+            if user:
+                user_id = user.id
+            else:
+                raise UserNotFound()
         return user_id
 
     def get_tweets(
@@ -110,11 +165,11 @@ class BotMethods:
         """
          Generator for getting the tweets from a user
 
-        :param:: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
-        :param:: pages: (`int`) number of pages to be scraped
-        :param:: replies: (`boolean`) get the replied tweets of the user too
-        :param:: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param:: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: replies: (`boolean`) get the replied tweets of the user too
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
 
         :return: (.types.usertweet.UserTweets, list[.types.twDataTypes.Tweet])
         """
@@ -127,11 +182,187 @@ class BotMethods:
 
         return userTweets.generator()
 
+    def get_user_highlights(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            replies: bool = False,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ):
+        """
+         Get the tweets from a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: replies: (`boolean`) get the replied tweets of the user too
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: .types.usertweet.userHighlights
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userHighlights = UserHighlights(user_id, self, pages, replies, wait_time, cursor)
+
+        list(userHighlights.generator())
+
+        return userHighlights
+
+    def iter_user_highlights(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            replies: bool = False,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ):
+
+        """
+         Generator for getting the tweets from a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: replies: (`boolean`) get the replied tweets of the user too
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: (.types.usertweet.UserHighlights, list[.types.twDataTypes.Tweet])
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userHighlights = UserHighlights(user_id, self, pages, replies, wait_time, cursor)
+
+        return userHighlights.generator()
+
+    def get_user_likes(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            replies: bool = False,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ):
+        """
+         Get the liked tweets of a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: replies: (`boolean`) get the replied tweets of the user too
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: .types.usertweet.userLikes
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userLikes = UserLikes(user_id, self, pages, replies, wait_time, cursor)
+
+        list(userLikes.generator())
+
+        return userLikes
+
+    def iter_user_likes(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            replies: bool = False,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ):
+
+        """
+         Generator for getting the liked tweets of a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: replies: (`boolean`) get the replied tweets of the user too
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: (.types.usertweet.UserLikes, list[.types.twDataTypes.Tweet])
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userLikes = UserLikes(user_id, self, pages, replies, wait_time, cursor)
+
+        return userLikes.generator()
+
+    @AuthRequired
+    def get_user_media(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ) -> UserMedia:
+        """
+         Get the media from a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: .types.usertweet.UserMedia
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userMedia = UserMedia(user_id, self, pages, wait_time, cursor)
+
+        list(userMedia.generator())
+
+        return userMedia
+
+    @AuthRequired
+    def iter_user_media(
+            self,
+            username: Union[str, int, User],
+            pages: int = 1,
+            wait_time: Union[int, list, tuple] = 2,
+            cursor: str = None
+    ):
+
+        """
+         Generator for getting the media from a user
+
+        :param: username: (`str` | `int` | `User`) username of the user whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+
+        :return: (.types.usertweet.UserMedia, list[.types.twDataTypes.Tweet])
+        """
+        if wait_time is None:
+            wait_time = 0
+
+        user_id = self._get_user_id(username)
+
+        userMedia = UserMedia(user_id, self, pages, wait_time, cursor)
+
+        return userMedia.generator()
+
+    @AuthRequired
     def get_trends(self):
         """
         Get the Trends from you locale
 
-        :return:list of .types.twDataTypes.Trends
+        :return: list of .types.twDataTypes.Trends
         """
         trends = []
         response = self.request.get_trends()
@@ -143,10 +374,11 @@ class BotMethods:
         for entry in entries['entries']:
             if str(entry['entryId']) == "trends":
                 for item in entry['content']['timelineModule']['items']:
-                    trends.append(Trends(item))
+                    trends.append(Trends(self, item))
 
         return trends
 
+    @AuthRequired
     def search(
             self,
             keyword: str,
@@ -179,6 +411,7 @@ class BotMethods:
 
         return search
 
+    @AuthRequired
     def iter_search(
             self,
             keyword: str,
@@ -208,7 +441,12 @@ class BotMethods:
 
         return search.generator()
 
-    def get_audio_space(self, space_id: Union[str, Tweet]):
+    @AuthRequired
+    def typehead_user_search(self, keyword):
+        return TypeHeadSearch(self, keyword, "users")
+
+    @AuthRequired
+    def get_audio_space(self, space_id: Union[str, Tweet]) -> AudioSpace:
         """
 
         :param: space_id: ID of the Audio Space , or the Tweet Object that Space Audio is part of.
@@ -220,8 +458,12 @@ class BotMethods:
 
         space = self.http.get_audio_space(space_id)
 
-        return AudioSpace(space, self)
+        if not find_objects(space, "metadata", None):
+            raise AudioSpaceNotFound(404, "BadRequest", response=space)
 
+        return AudioSpace(self, space)
+
+    @AuthRequired
     def get_community(self, community_id):
         """
 
@@ -230,8 +472,9 @@ class BotMethods:
         """
 
         response = self.http.get_community(community_id)
-        return Community(response, self)
+        return Community(self, response)
 
+    @AuthRequired
     def iter_community_tweets(
             self,
             community_id: Union[str, int, Community],
@@ -244,11 +487,11 @@ class BotMethods:
         """
          Generator for getting the tweets from a community
 
-        :param:: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
-        :param:: pages: (`int`) number of pages to be scraped
-        :param:: filter_: (`str`) Filter the Tweets
-        :param:: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param:: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: filter_: (`str`) Filter the Tweets
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
 
         :return: (.types.community.CommunityTweets, list[.types.twDataTypes.Tweet])
         """
@@ -262,6 +505,7 @@ class BotMethods:
 
         return communityTweets.generator()
 
+    @AuthRequired
     def get_community_tweets(
             self,
             community_id: Union[str, int, Community],
@@ -274,11 +518,11 @@ class BotMethods:
         """
          Getting the tweets from a community
 
-        :param:: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
-        :param:: pages: (`int`) number of pages to be scraped
-        :param:: filter_: (`str`) Filter the Tweets
-        :param:: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param:: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: filter_: (`str`) Filter the Tweets
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
 
         :return: .types.community.CommunityTweets
         """
@@ -294,6 +538,7 @@ class BotMethods:
 
         return communityTweets
 
+    @AuthRequired
     def get_community_members(
             self,
             community_id: Union[str, int, Community],
@@ -305,11 +550,11 @@ class BotMethods:
         """
          Getting the Members from a community
 
-        :param:: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
-        :param:: pages: (`int`) number of pages to be scraped
-        :param:: filter_: (`str`) Filter the Members
-        :param:: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param:: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: filter_: (`str`) Filter the Members
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
 
         :return: .types.community.CommunityMembers
         """
@@ -326,6 +571,7 @@ class BotMethods:
 
         return communityTweets
 
+    @AuthRequired
     def iter_community_members(
             self,
             community_id: Union[str, int, Community],
@@ -337,11 +583,11 @@ class BotMethods:
         """
          Getting the Members from a community
 
-        :param:: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
-        :param:: pages: (`int`) number of pages to be scraped
-        :param:: filter_: (`str`) Filter the Members
-        :param:: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param:: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: community_id: (`str` | `int` | `Community`) ID of the community whom to get the tweets of
+        :param: pages: (`int`) number of pages to be scraped
+        :param: filter_: (`str`) Filter the Members
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
 
         :return: (.types.community.CommunityMembers, [.types.twDataTypes.User])
         """
@@ -355,7 +601,8 @@ class BotMethods:
         communityTweets = CommunityMembers(community_id, self, pages, filter_, wait_time, cursor)
 
         return communityTweets.generator()
-    
+
+    @AuthRequired
     def get_user_followers(
             self,
             username: Union[str, int, User],
@@ -387,6 +634,7 @@ class BotMethods:
 
         return userFollowers
 
+    @AuthRequired
     def iter_user_followers(
             self,
             username: Union[str, int, User],
@@ -417,6 +665,7 @@ class BotMethods:
 
         return userFollowers.generator()
 
+    @AuthRequired
     def get_user_followings(
             self,
             username: Union[str, int, User],
@@ -448,6 +697,7 @@ class BotMethods:
 
         return userFollowings
 
+    @AuthRequired
     def iter_user_followings(
             self,
             username: Union[str, int, User],
@@ -478,6 +728,7 @@ class BotMethods:
 
         return userFollowings.generator()
 
+    @AuthRequired
     def get_tweet_comments(
             self,
             tweet_id: Union[str, Tweet],
@@ -488,18 +739,21 @@ class BotMethods:
     ):
         """
 
-        :param tweet_id: Tweet ID or the Tweet Object of which the Comments to get
-        :param pages: (`int`) The number of pages to get
-        :param wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param cursor: (`str`) Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
-        :param get_hidden: (`bool`) get the hidden comments (most likely offensive comments)
+        :param: tweet_id: Tweet ID or the Tweet Object of which the Comments to get
+        :param: pages: (`int`) The number of pages to get
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: (`str`) Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: get_hidden: (`bool`) get the hidden comments (most likely offensive comments)
         :return: .types.likes.TweetLikes
         """
 
-        comments = TweetComments(tweet_id, self, get_hidden, pages, wait_time, cursor)
+        tweetId = get_tweet_id(tweet_id)
+
+        comments = TweetComments(tweetId, self, get_hidden, pages, wait_time, cursor)
         list(comments.generator())
         return comments
 
+    @AuthRequired
     def iter_tweet_comments(
             self,
             tweet_id: Union[str, Tweet],
@@ -507,25 +761,36 @@ class BotMethods:
             wait_time: Union[int, list, tuple] = 2,
             cursor: str = None,
             get_hidden: bool = False
-
     ):
         """
 
-        :param tweet_id: Tweet ID or the Tweet Object of which the Likes to get
-        :param pages: (`int`) The number of pages to get
-        :param wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
-        :param cursor: (`str`) Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
-        :param get_hidden: (`bool`) get the hidden comments (most likely offensive comments)
+        :param: tweet_id: Tweet ID or the Tweet Object of which the Likes to get
+        :param: pages: (`int`) The number of pages to get
+        :param: wait_time: (`int`, `list`, `tuple`) seconds to wait between multiple requests
+        :param: cursor: (`str`) Pagination cursor if you want to get the pages from that cursor up-to (This cursor is different from actual API cursor)
+        :param: get_hidden: (`bool`) get the hidden comments (most likely offensive comments)
 
         :return: (.types.likes.TweetLikes, list[.types.twDataTypes.User])
         """
 
-        if isinstance(tweet_id, Tweet):
-            tweet_id = tweet_id.id
+        tweetId = get_tweet_id(tweet_id)
 
-        comments = TweetComments(tweet_id, self, get_hidden, pages, wait_time, cursor)
+        comments = TweetComments(tweetId, self, get_hidden, pages, wait_time, cursor)
 
         return comments.generator()
+
+    @AuthRequired
+    def tweet_edit_history(self, identifier) -> TweetHistory:
+        """
+        Get Edit History of a Tweet
+
+        :param identifier: (`str`) The unique identifier of the tweet , either the `Tweet id` or `Tweet Link`
+
+        :return: .types.usertweet.TweetHistory
+        """
+
+        tweetId = get_tweet_id(identifier)
+        return TweetHistory(tweetId, self)
 
     def tweet_detail(self, identifier: str) -> Tweet:
         """
@@ -536,13 +801,13 @@ class BotMethods:
         :return: .types.twDataTypes.Tweet
         """
 
-        tweetId = re.findall("\d+", identifier)[-1]
+        tweetId = get_tweet_id(identifier)
 
         response = self.request.get_tweet_detail(tweetId)
 
         if self.user is None:
             if find_objects(response, "tweetResult", None):
-                return Tweet(response, self, response)
+                return Tweet(self, response, response)
         else:
             _tweet_before = []
             entries = find_objects(response, "type", "TimelineAddEntries")
@@ -552,7 +817,7 @@ class BotMethods:
 
             for entry in entries['entries']:
                 if str(entry['entryId']).split("-")[0] == "tweet":
-                    tweet = Tweet(entry, self, response)
+                    tweet = Tweet(self, entry, response)
 
                     if str(tweet.id) == str(tweetId):
                         tweet.threads.extend(_tweet_before)
@@ -561,4 +826,39 @@ class BotMethods:
                         _tweet_before.append(tweet)
 
         raise InvalidTweetIdentifier(response=response)
+
+    def translate_tweet(self, tweet_id, language):
+        """
+            Translate Tweet in another Language
+
+            :param tweet_id: Tweet ID of the Tweet to be translated
+            :param language: In which Language you want to translate the Tweet (see tweety.filters.Language)
+            :return: .types.twDataTypes.TweetTranslate
+        """
+
+        tweetId = get_tweet_id(tweet_id)
+        language = check_translation_lang(language)
+        response = self.http.get_tweet_translation(tweetId, language)
+        return TweetTranslate(self, response)
+
+    def search_gifs(self, search_term, pages=1, cursor=None, wait_time=2):
+        search = GifSearch(search_term, self, pages, cursor, wait_time)
+        list(search.generator())
+        return search
+
+    def iter_search_gifs(self, search_term, pages=1, cursor=None, wait_time=2):
+        search = GifSearch(search_term, self, pages, cursor, wait_time)
+        return search.generator()
+
+    def search_place(self, lat=None, long=None, search_term=None):
+        """
+        Search Place either using `search_term` , or `latitude` and `longitude`
+
+        :param lat: Latitude of Place
+        :param long: Longitude of Place
+        :param search_term: Search Term of Place
+        :return: .type.places.Places
+        """
+
+        return Places(self, lat, long, search_term)
 

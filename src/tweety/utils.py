@@ -1,14 +1,19 @@
 import base64
 import datetime
 import hashlib
+import inspect
+import json
 import os.path
 import random
 import re
 import string
 import sys
+import traceback
 import uuid
 from dateutil import parser as date_parser
+from urllib.parse import urlparse
 from .exceptions_ import AuthenticationRequired
+from .filters import Language
 
 GUEST_TOKEN_REGEX = re.compile("gt=(.*?);")
 MIME_TYPES = {
@@ -32,17 +37,19 @@ SENSITIVE_MEDIA_TAGS = ['adult_content', 'graphic_violence', 'other']
 def AuthRequired(cls):
     def method_wrapper_decorator(func):
         def wrapper(self, *args, **kwargs):
-            if self.user is None:
+            if self.me is None:
                 raise AuthenticationRequired(200, "GenericForbidden", None)
 
             return func(self, *args, **kwargs)
 
         return wrapper
 
-    for name, method in vars(cls).items():
-        if name != "__init__" and callable(method):
-            setattr(cls, name, method_wrapper_decorator(method))
-    return cls
+    if inspect.isclass(cls):
+        for name, method in vars(cls).items():
+            if name != "__init__" and callable(method):
+                setattr(cls, name, method_wrapper_decorator(method))
+        return cls
+    return method_wrapper_decorator(cls)
 
 
 def replace_between_indexes(original_string, from_index, to_index, replacement_text):
@@ -54,10 +61,11 @@ def decodeBase64(encoded_string):
     return str(base64.b64decode(bytes(encoded_string, "utf-8")))[2:-1]
 
 
-def bar_progress(filename, current, total, width=80):
+def bar_progress(filename, total, current, width=80):
     progress_message = f"[{filename}] Downloading: %d%% [%d / %d] bytes" % (current / total * 100, current, total)
     sys.stdout.write("\r" + progress_message)
     sys.stdout.flush()
+
 
 def parse_wait_time(wait_time):
     if not wait_time:
@@ -68,9 +76,10 @@ def parse_wait_time(wait_time):
 
     return int(wait_time)
 
-def custom_json(self):
+
+def custom_json(self, **kwargs):
     try:
-        return self.json()
+        return json.loads(self.content, **kwargs)
     except:
         return None
 
@@ -94,9 +103,10 @@ def create_query_id():
 
 
 def check_if_file_is_image(file):
-    if not os.path.exists(file):
+    if not os.path.exists(file) and not str(file).startswith("https://"):
         raise ValueError("Path {} doesn't exists".format(file))
 
+    file = file.split("?")[0]
     file_extension = file.split(".")[-1]
 
     if file_extension not in list(MIME_TYPES.keys()):
@@ -112,6 +122,9 @@ def get_random_string(length):
 
 
 def calculate_md5(file_path):
+    if str(file_path).startswith("https://"):
+        return None
+
     md5_hash = hashlib.md5()
     with open(file_path, "rb") as file:
         for chunk in iter(lambda: file.read(4096), b""):
@@ -166,7 +179,11 @@ def find_objects(obj, key, value, recursive=True, none_value=None):
     if len(results) == 0:
         return none_value
 
+    if not recursive:
+        return results[0]
+
     return results
+
 
 def create_pool(duration: int, *choices):
     data = {
@@ -181,6 +198,7 @@ def create_pool(duration: int, *choices):
 
     return data
 
+
 def parse_time(time):
     if not time:
         return None
@@ -192,3 +210,26 @@ def parse_time(time):
             return datetime.datetime.fromtimestamp(int(time) / 1000)
 
     return date_parser.parse(time)
+
+
+def get_user_from_typehead(target_username, users):
+    for user in users:
+        if str(user.username).lower() == str(target_username).lower():
+            return user
+    return None
+
+
+def get_tweet_id(tweet_identifier):
+    if str(tweet_identifier.__class__.__name__) == "Tweet":
+        return tweet_identifier.id
+    else:
+        return urlparse(str(tweet_identifier)).path.split("/")[-1]
+
+
+def check_translation_lang(lang):
+    for k, v in vars(Language).items():
+        if not str(k).startswith("_"):
+            if str(k).lower() == str(lang).lower() or str(v).lower() == str(lang).lower():
+                return v
+
+    raise ValueError(f"Language {lang} is not supported")

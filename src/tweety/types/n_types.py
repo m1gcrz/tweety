@@ -2,14 +2,16 @@ import datetime
 import os
 import time
 from http.cookiejar import MozillaCookieJar
-
 from httpx._content import encode_multipart_data
+from . import Gif
 from ..utils import calculate_md5, get_random_string, check_if_file_is_image
 from ..exceptions_ import *
 
 PROXY_TYPE_SOCKS4 = SOCKS4 = 1
 PROXY_TYPE_SOCKS5 = SOCKS5 = 2
 PROXY_TYPE_HTTP = HTTP = 3
+HOME_TIMELINE_TYPE_FOR_YOU = "HomeTimeline"
+HOME_TIMELINE_TYPE_FOLLOWING = "HomeLatestTimeline"
 
 
 class Proxy:
@@ -20,6 +22,10 @@ class Proxy:
         self.username = username
         self.port = port
         self.proxy = self.__parse__()
+
+    def __iter__(self):
+        for k, v in self.proxy.items():
+            yield k, v
 
     def __proxy_url__(self):
         if self.username and self.password:
@@ -52,9 +58,11 @@ class GenericError:
         32: InvalidCredentials,
         144: InvalidTweetIdentifier,
         88: RateLimitReached,
+        477: RateLimitReached,
         399: InvalidCredentials,
         220: InvalidCredentials,
-        214: InvalidBroadcast
+        214: InvalidBroadcast,
+        366: InvalidTweetIdentifier,
     }
 
     def __init__(self, response, error_code, message=None):
@@ -82,9 +90,9 @@ class GenericError:
                 retry_after=self.retry_after
             )
 
-        raise UnknownError(
+        raise TwitterError(
             error_code=self.error_code,
-            error_name=TWITTER_ERRORS[self.error_code],
+            error_name=TWITTER_ERRORS.get(self.error_code, 0),
             response=self.response,
             message="[{}] {}".format(self.error_code, self.message)
         )
@@ -113,7 +121,7 @@ class Cookies:
                 if isinstance(self._raw_cookies, str):
                     cookie_list = self._raw_cookies.split(";")
                     for cookie in cookie_list:
-                        split_cookie = cookie.strip().split("=")
+                        split_cookie = cookie.strip().split("=", 1)
 
                         if len(split_cookie) >= 2:
                             cookie_key = split_cookie[0]
@@ -126,6 +134,15 @@ class Cookies:
 
                 for key, value in true_cookies.items():
                     setattr(self, key.strip(), value.strip())
+
+    def to_dict(self):
+        result = {}
+        for k, v in vars(self).items():
+
+            if not k.startswith("_"):
+                result[k] = v
+
+        return result
 
     def __str__(self):
         string = ""
@@ -140,24 +157,42 @@ class Cookies:
 class UploadedMedia:
     FILE_CHUNK_SIZE = 2 * 1024 * 1024  # 2 mb
 
-    def __init__(self, file_path, client, alt_text=None, sensitive_media_warning=None, media_category="tweet_image"):
+    def __init__(
+            self,
+            file_path,
+            client,
+            alt_text=None,
+            sensitive_media_warning=None,
+            media_category="tweet_image"
+    ):
         self.media_id = None
         self._file = file_path
         self._client = client
         self._alt_text = alt_text
         self._sensitive_media_warning = sensitive_media_warning if sensitive_media_warning else []
+        self._source_url = self._get_source_url()
         self.size = self._get_size()
         self.mime_type = self.get_mime_type()
         self._media_category = self._get_media_category(media_category)
         self.md5_hash = calculate_md5(self._file)
 
+    def _get_source_url(self):
+        if isinstance(self._file, Gif):
+            return self._file.url
+        elif str(self._file).startswith("https://"):
+            return self._file
+
+        return None
+
     def _get_media_category(self, category):
         media_for = category.split("_")[0]
         media_type = self.mime_type.split("/")[0]
-        return f"{media_for}_{media_type}"
+        return f"{media_for}_{media_type}" if "gif" not in self.mime_type else f"{media_for}_gif"
 
     def _get_size(self):
-        return os.path.getsize(self._file)
+        if not self._source_url:
+            return os.path.getsize(self._file)
+        return 0
 
     def get_mime_type(self):
         return check_if_file_is_image(self._file)
@@ -167,7 +202,7 @@ class UploadedMedia:
         return bytes(f'------WebKitFormBoundary{get_random_string(16)}', "utf-8")
 
     def _initiate_upload(self):
-        response = self._client.http.upload_media_init(self.size, self.mime_type, self._media_category)
+        response = self._client.http.upload_media_init(self.size, self.mime_type, self._media_category, source_url=self._source_url)
         return response['media_id_string']
 
     def _append_upload(self, media_id):
@@ -184,7 +219,10 @@ class UploadedMedia:
         self._client.http.set_media_set_metadata(self.media_id, self._alt_text, self._sensitive_media_warning)
 
     def _finish_upload(self, media_id):
-        response = self._client.http.upload_media_finalize(media_id, self.md5_hash)
+        if not self._source_url:
+            response = self._client.http.upload_media_finalize(media_id, self.md5_hash)
+        else:
+            response = {"processing_info": {"state": "pending", "check_after_secs": 1}}
 
         if not response.get('processing_info'):
             return
@@ -200,7 +238,10 @@ class UploadedMedia:
 
     def upload(self):
         self.media_id = self._initiate_upload()
-        self._append_upload(self.media_id)
+
+        if not self._source_url:
+            self._append_upload(self.media_id)
+
         self._finish_upload(self.media_id)
 
         if self._alt_text:
